@@ -1,13 +1,5 @@
 package main
 
-/*
-#include <math.h>
-
-float sqrt32(float x) {
-    return sqrtf(x);
-}
-*/
-import "C"
 import (
 	"encoding/binary"
 	"fmt"
@@ -408,10 +400,6 @@ func accum(a, b []float32) {
 
 }
 
-func sqrt(x float32) float32 {
-	return float32(C.sqrt32(C.float(x)))
-}
-
 func rmsNorm(dest, src, weight []float32) {
 	sumSquares := float32(0.0)
 	for _, x := range src {
@@ -420,7 +408,7 @@ func rmsNorm(dest, src, weight []float32) {
 	// fmt.Printf("rmsnorm ss0: %.20f\n", sumSquares)
 	ss := sumSquares/float32(len(src)) + float32(1e-5)
 	// fmt.Printf("rmsnorm ss1: %.20f\n", ss)
-	ss = 1.0 / sqrt(ss)
+	ss = 1.0 / float32(math.Sqrt(float64(ss)))
 	// fmt.Printf("rmsnorm ss2: %.20f\n", ss)
 	for i, x := range src {
 		dest[i] = weight[i] * (ss * x)
