@@ -1,4 +1,6 @@
-## llama2.c
+## go-llama2
+
+A Go port of [llama2.c](https://github.com/karpathy/llama2.c)
 
 <p align="center">
   <img src="assets/llama_cute.jpg" width="300" height="300" alt="Cute Llama">
