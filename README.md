@@ -2,6 +2,14 @@
 
 A Go port of [llama2.c](https://github.com/karpathy/llama2.c)
 
+**Running go-llama2:**
+
+After obtaining the model weights as described below.
+
+```shell
+$ cd go; go run . ../stories15M.bin
+```
+
 <p align="center">
   <img src="assets/llama_cute.jpg" width="300" height="300" alt="Cute Llama">
 </p>
