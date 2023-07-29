@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -54,16 +55,14 @@ type RunState struct {
 }
 
 func main() {
-	// disable stdout buffering
-	// no equivalent in Go, stdout is unbuffered by default
+	checkpoint := ""    // e.g. out/model.bin
+	temperature := 0.9  // e.g. 1.0, or 0.0
+	steps := int32(256) // max number of steps to run for, 0: use seq_len
+	prompt := ""        // e.g. "The meaning of life is"
 
-	// poor man's Go flag.Parse()
-	checkpoint := ""
-	temperature := 0.9
-	steps := int32(256)
 	// 'checkpoint' is necessary arg
 	if len(os.Args) < 2 {
-		fmt.Printf("Usage: %s <checkpoint_file> [temperature] [steps]\n", os.Args[0])
+		fmt.Printf("Usage: %s <checkpoint_file> [temperature] [steps] [prompt]\n", os.Args[0])
 		os.Exit(1)
 	}
 	checkpoint = os.Args[1]
@@ -71,10 +70,12 @@ func main() {
 	if len(os.Args) >= 3 {
 		temperature, _ = strconv.ParseFloat(os.Args[2], 64)
 	}
-	// seed is optional
 	if len(os.Args) >= 4 {
 		s, _ := strconv.Atoi(os.Args[3])
 		steps = int32(s)
+	}
+	if len(os.Args) >= 5 {
+		prompt = os.Args[4]
 	}
 
 	// read in the config header
@@ -110,59 +111,91 @@ func main() {
 	}
 
 	vocab := make([]string, config.VocabSize)
+	vocabScores := make([]float32, config.VocabSize)
+	var maxTokenLength uint32
 	tokfile, err := os.Open("../tokenizer.bin")
 	if err != nil {
 		log.Fatalln("Unable to open tokenizer.bin", err)
 	}
 	defer tokfile.Close()
+	if err := binary.Read(tokfile, binary.LittleEndian, &maxTokenLength); err != nil {
+		log.Fatalln("Unable to read maxTokenLength from tokenizer.bin", err)
+	}
 	for i := int32(0); i < config.VocabSize; i++ {
+		if err := binary.Read(tokfile, binary.LittleEndian, &vocabScores[i]); err != nil {
+			log.Fatalln("Unable to read vocabScores from tokenizer.bin", err)
+		}
 		var length int32
-		err = binary.Read(tokfile, binary.LittleEndian, &length)
-		if err != nil {
+		if err = binary.Read(tokfile, binary.LittleEndian, &length); err != nil {
 			log.Fatalln("Unable to read length from tokenizer.bin", err)
 		}
 		bytes := make([]byte, length)
-		_, err = io.ReadFull(tokfile, bytes)
-		if err != nil {
+		if _, err = io.ReadFull(tokfile, bytes); err != nil {
 			log.Fatalln("Unable to read bytes from tokenizer.bin", err)
 		}
 		vocab[i] = string(bytes)
 	}
 
-	// the current position we are in
-	start := time.Now()
-	var next, token, pos int32
-	token = 1 // 1 = BOS token in Llama-2 sentencepiece
-	pos = 0
+	// process the prompt, if any
+	promptTokens, err := bpeEncode(prompt, vocab, vocabScores, maxTokenLength)
+	if err != nil {
+		log.Fatalln("Unable to encode prompt", err)
+	}
+
+	// start the main loop
+	start := time.Time{} // used to time our code, only initialized after first iteration
+
+	var next int32      // will store the next token in the sequence
+	var token int32 = 1 // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
+	var pos int32 = 0   // position in the sequence
+
+	fmt.Println("<s>") // explicit print the initial BOS token for stylistic symmetry reasons
 
 	for pos < steps {
 		// forward the transformer to get logits for the next token
 		transformer(token, pos, &config, &state, &weights)
 
-		// sample the next token
-		if temperature == 0.0 {
-			// greedy argmax sampling
-			next = argmax(state.Logits)
+		if pos < int32(len(promptTokens)) {
+			// if we are still processing the input prompt, force the next prompt token
+			next = int32(promptTokens[pos])
+
 		} else {
-			// apply the temperature to the logits
-			for q := int32(0); q < config.VocabSize; q++ {
-				state.Logits[q] /= float32(temperature)
+			// sample the next token
+			if temperature == 0.0 {
+				// greedy argmax sampling
+				next = argmax(state.Logits)
+			} else {
+				// apply the temperature to the logits
+				for q := int32(0); q < config.VocabSize; q++ {
+					state.Logits[q] /= float32(temperature)
+				}
+				// apply softmax to the logits to get the probabilities for next token
+				softmax(state.Logits)
+				// we now want to sample from this distribution to get the next token
+				next = sample(state.Logits)
 			}
-			// apply softmax to the logits to get the probabilities for next token
-			softmax(state.Logits)
-			// we now want to sample from this distribution to get the next token
-			next = sample(state.Logits)
 		}
-		fmt.Print(vocab[next])
+		var tokenStr string
+		if token == 1 && vocab[next][0] == ' ' {
+			// if the previous token was BOS, and the next token starts with a space,
+			// then we want to trim the space
+			tokenStr = vocab[next][1:]
+		} else {
+			tokenStr = vocab[next]
+		}
+		fmt.Print(tokenStr)
 
 		// advance forward
 		token = next
 		pos++
+		if start.IsZero() {
+			start = time.Now()
+		}
 	}
 
 	// report achieved tok/s
 	end := time.Now()
-	fmt.Printf("\nachieved tok/s: %f\n", float64(steps)/end.Sub(start).Seconds())
+	fmt.Printf("\nachieved tok/s: %f\n", float64(steps-1)/end.Sub(start).Seconds())
 }
 
 func allocWeights(w *TransformerWeights, p *Config) {
@@ -432,6 +465,9 @@ func argmax(v []float32) int32 {
 	return int32(maxI)
 }
 
+// ----------------------------------------------------------------------------
+// functions to sample the next token from the transformer's predicted distribution
+
 func sample(probabilities []float32) int32 {
 	// sample index from probabilities, they must sum to 1
 	r := rand.Float32()
@@ -443,4 +479,70 @@ func sample(probabilities []float32) int32 {
 		}
 	}
 	return int32(len(probabilities)) - 1 // in case of rounding errors
+}
+
+// byte pair encoding (BPE) tokenizer, encodes strings into tokens so we can prompt
+
+func strLookup(str string, vocab []string) int {
+	// find the first perfect match for str in vocab, return its index or -1 if not found
+	for i, v := range vocab {
+		if str == v {
+			return i
+		}
+	}
+	return -1
+}
+
+// bpeEncode encodes text into tokens using byte pair encoding
+func bpeEncode(text string, vocab []string, vocabScores []float32, maxTokenLength uint32) ([]int, error) {
+	// a temporary buffer to merge two consecutive tokens
+	strBuffer := strings.Builder{}
+	strBuffer.Grow(int(maxTokenLength * 2)) // *2 for concat, +1 for null terminator
+
+	// first encode every individual byte in the input string
+	tokens := make([]int, len(text))
+	nTokens := len(text)
+
+	for i, c := range text {
+		id := strLookup(string(c), vocab)
+		if id == -1 {
+			return nil, fmt.Errorf("bpeEncode: could not find byte %s in vocab", string(c))
+		}
+		tokens[i] = id
+	}
+
+	// merge the best consecutive pair each iteration, according the scores in vocabScores
+	for {
+		bestScore := float32(-1e10)
+		bestID := -1
+		bestIdx := -1
+
+		for i := 0; i < nTokens-1; i++ {
+			// check if we can merge the pair (tokens[i], tokens[i+1])
+			strBuffer.Reset()
+			strBuffer.WriteString(vocab[tokens[i]])
+			strBuffer.WriteString(vocab[tokens[i+1]])
+			id := strLookup(strBuffer.String(), vocab)
+			if id != -1 && vocabScores[id] > bestScore {
+				// this merge pair exists in vocab! record its score and position
+				bestScore = vocabScores[id]
+				bestID = id
+				bestIdx = i
+			}
+		}
+
+		if bestIdx == -1 {
+			break // we couldn't find any more pairs to merge, so we're done
+		}
+
+		// merge the consecutive pair (bestIdx, bestIdx+1) into new token bestID
+		tokens[bestIdx] = bestID
+		// delete token at position bestIdx+1, shift the entire sequence back 1
+		for i := bestIdx + 1; i < nTokens-1; i++ {
+			tokens[i] = tokens[i+1]
+		}
+		nTokens-- // token length decreased
+	}
+
+	return tokens[:nTokens], nil
 }
